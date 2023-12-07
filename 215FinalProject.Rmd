@@ -1,0 +1,613 @@
+---
+title: "Exploring County-Level Asthma Rate Patterns in North Carolina"
+subtitle: "GEOG 215: Spatial Data Science Final Project"
+author: "Brianna Chan, Ariel Lam, and Anthony Price"
+date: "5/4/2020"
+output: 
+  html_document:
+    number_sections: true
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: TRUE
+      smooth_scroll: TRUE
+---
+
+***
+
+# Introduction
+**Asthma is a respiratory condition marked by spasms in the bronchi of the lungs that cause difficulty in breathing.** According to the Centers for Disease Control and Prevention (CDC), 1 in 13 people suffer from asthma, and as many as 25 million of these people are Americans. Realizing the magnitude of asthma prevalence on a national scale, our group first sought to answer the overarching question of how socioeconomic status affects prevalence of asthma. This led us to ponder the implications of other factors on asthma, that may be related directly or indirectly to socioeconomic status. Our other questions regarded *what type of counties show higher asthma rates*, *what health behaviors are most impactful to asthma rates*, *how environmental injustices may be related to asthma*, *what effects air quality has on asthma distribution*, and *what relationship exists between asthma rates and health care access.* **This investigation of asthma in North Carolina at the county level will help us to trace observed spatial trends back to their roots; having this holistic knowledge on asthma distribution can help us to develop better interventions, prevention methods, and treatments that improve the livelihoods of those affected.**
+
+---
+
+# Data Preparation
+We obtained our asthma dataset from the *Behavioral Risk Factor Surveillance System (BRFSS)*, which provides information on the total number of cases based on the total number of recorded discharges of asthma diagnosis in 2014, as well as the corresponding asthma rates by county. The *County Health Dataset of 2014* provided the z-scores for physical environment for each county; the factors taken into account when determining the physical environment value include air and water quality (measured by drinking water violations and particulate matter), housing, and transit data. The County Health Dataset also provides data on the percentage of average PM 2.5 levels, which is particulate matter that has a diameter of less than 2.5 micrometers, as a measurement for air pollution. Our selected health factors include information on insurance coverage, access to exercise, physical activity, and smoking activity, which is also provided to us by the County Health Dataset. The *Census API* is used to extract data on the racial and socioeconomic demographics of each North Carolina county. The shapefile used for the NC county border geometry was downloaded from an online source, which we imported using the sf package.
+
+After we found relevant datasets and associated variables, we extracted the information that we needed. We extracted demographic information, like racial and socioeconomic (median household income) information, pertaining to the North Carolina counties. Unique variables that we extracted included whether a county has a minority or white majority population, the percentage of racial groups per county, and more. We then joined asthma rates data to the census data. To add onto this data table, we extracted and joined from the county health data the environmental quality and health factors that we thought were relevant to our investigation. The final dataframe with all of the basic information, without the geospatial information, is called `all_data`. Later, when the spatial information is needed for mapmaking, the `all_data` dataframe gains the geometry of the NC counties, leading to the formation of a new dataframe called `all_data_geo`. As a general rule of thumb, before we joined datasets, we made sure to clean the title names into the same formatting for cohesiveness and ease of alteration. To make things easier to facet, we further tidied the data. For example, the pivot_longer function was used to place all of the health factors into one column for each county, which made it easier to compare them against asthma rates and display them in graphs. We used these functions for other datasets as well, which helped us to more easily analyze relationships between factors.
+
+## Load Packages and API
+The following code shows the packages required for performing data analysis. The Census API key, which provides access to datasets on demographics, is also obtained and set here.
+
+```{r edit_html}
+## Allows for alteration of HTML formatting
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r check_load_packages, include = FALSE, message = FALSE}
+## Check packages
+  packageList <- c("tidycensus","sf","janitor","spdep", "plotly")
+  for(p in packageList){
+    if (!requireNamespace(p)) {
+      install.packages(p)
+    }
+  }
+
+## Load packages
+library(tidyverse)
+library(sf)
+library(janitor)
+library(tidycensus)
+library(readxl)
+library(plotly)
+
+## Obtain and set API Key
+census_api_key(key = "ff9343eecb85d5044ee3800ae75cd82f2e41c0f6", install = TRUE, overwrite = TRUE)
+```
+
+## Compile and Organize Data
+
+### Census Data
+
+The Census data was collected using the Census API key, which was obtained earlier in this document. Information on population demographics was provided through the Census API.
+
+```{r census_data}
+## Load variables from API
+v17 <- load_variables(2018, "acs5", cache = TRUE)
+# head(v17)
+
+## Filter by string
+pop_cols <- v17 %>% filter(concept %>% str_detect("TOTAL POPULATION"))
+# head(pop_cols)
+
+## Get list of variables
+pop_cols <- v17 %>% filter(concept %>% str_detect("^TOTAL POPULATION$"))
+# head(pop_cols)
+
+## Detect Not hispanic or latino
+hisp_cols <- v17 %>% filter(concept %>% str_detect("HISPANIC OR LATINO")) %>%
+  filter(concept %>% str_detect("RACE")) %>% 
+  filter(label %>% str_detect(fixed("not hispanic or latino",ignore_case = T)))
+## Detect Median Household Income
+inc_cols <- v17 %>% filter(concept %>% str_detect("MEDIAN HOUSEHOLD INCOME"))
+
+## Find the code for Total Population (in the name column of pop_cols)
+pop_tot_col <- pop_cols$name
+
+pop_total_colname <- "Total Population"
+
+race_col <- c("B03002_002","B03002_003","B03002_004","B03002_005") # Manually assign race column codes from the filtered hisp_cols df
+race_colname <-c("Not Hispanic","White","Black","Native Americans")
+
+## Manually assign race column codes from the filtered inccols df
+inc_col <- "B19013_001"
+## Provide Reasonable column name
+inc_colname <- "Med HH income"
+
+## Import Census data from tidycensus API based on list of variables
+nc_raw <- get_acs(geography = "county", 
+              variables = c(pop_tot_col, race_col, inc_col),
+              state = "NC", 
+              year = 2018,
+                output = "wide")
+
+## Remove unnecessary columns
+nc_wide <- nc_raw %>% select(-ends_with("m"))
+# glimpse(nc_wide)
+
+## Clean variable names
+colnames(nc_wide)[3:8] <- c(pop_total_colname,race_colname,inc_colname)
+nc_wide <- nc_wide %>% clean_names(case ="snake")
+# colnames(nc_wide)
+
+## Create new variables of interest
+nc_wide <- nc_wide %>% mutate(hispanic = total_population - not_hispanic,
+                             poc = total_population - white,
+                             white_majority = ifelse(white > poc, 1,0) %>% 
+                                recode_factor(`1` = 'white',
+                                                          `0` = 'poc')) %>%
+select(-not_hispanic)
+# glimpse(nc_wide)
+
+## Rearrange columns
+nc_wide <- nc_wide %>% select(geoid,name,white:native_americans,
+                              hispanic, poc, white_majority, total_population,
+                              med_hh_income)
+# glimpse(nc_wide)
+
+## Tidy data
+nc_tidy1 <- nc_wide %>% pivot_longer(names_to = "race",
+                              values_to = "race_count",
+                              cols = white:poc) 
+# glimpse(nc_tidy1)
+
+## Transform data by finding percentage of race for each county
+nc_tidy1 <- nc_tidy1 %>% mutate(race_pct = (race_count/total_population)*100)
+# glimpse(nc_tidy1)
+
+nc_tidy1$name <- nc_tidy1$name %>% str_replace(pattern = " County, North Carolina", replacement = "")
+## nc_tidy1$name %>% head
+
+# nc_tidy1 %>% sample_n(5)
+```
+
+### Asthma Data
+
+Asthma data was obtained from the Behavioral Risk Factor Surveillance System (BRFSS), and includes information on 2014 North Carolina hospital discharges with a primary diagnosis of asthma numbers and rates per 100,000 by county of residence. See here to access the dataset: https://schs.dph.ncdhhs.gov/data/databook2016/CD15%20Asthma%20hospitalizations%20by%20county.html
+
+```{r asthma_data}
+## Import asthma data
+asthma <- read_excel("NC_asthma.xls", sheet = 1)
+
+## Join asthma data with nc_wide
+nc_wide$name <- nc_wide$name %>% str_replace(pattern = " County, North Carolina", replacement = "") # Make the county names in nc_wide consistent with asthma data
+nc_wide_asthma_join <- left_join(nc_wide, asthma, by = c("name" = "Residence"))
+nc_wide_asthma_join <- nc_wide_asthma_join %>% clean_names(case ="snake")
+
+## nc_wide_asthma_join %>% sample_n(5)
+```
+
+### County Health Data
+
+County health data was provided by the 2014 County Health Rankings site, which provides information on health factors like environmental quality, uninsurance rates, health behaviors, and more. See here to access the dataset: https://www.countyhealthrankings.org/app/north-carolina/2014/downloads
+
+```{r county_health_data, results = "hide"}
+## Import county health data
+county_health_data <- read_excel("2014CH.xls", sheet = 4, skip = 1)
+
+## Clean and select the county health data relevant to our study
+county_health_data %>% clean_names(case = "snake")
+clean_HD <- county_health_data %>% select(County, average_daily_pm = "Average daily PM25", percent_uninsured = "% Uninsured", percent_physically_inactive = "% Physically Inactive", percent_access_to_exercise = "% With Access", percent_adult_smoking = "% Smokers" )
+
+## Clean and tidy finalized county health data
+tidy_HD <- clean_HD %>% filter(!is.na(County), !is.na(average_daily_pm), !is.na(percent_uninsured), !is.na(percent_physically_inactive), !is.na(percent_access_to_exercise), !is.na(percent_adult_smoking))
+
+## Import physical environment data from county health dataset
+physical_environment <- read_excel("2014CH.xls", sheet = 3, skip = 1)
+
+## Clean and tidy physical environment data
+physical_environment %>% clean_names(case = "snake")
+clean_physical_environment <- physical_environment %>% select(County, physical_environment_zscore = "Z-Score...14" )
+tidy_physical_environment <- clean_physical_environment %>% filter(!is.na(County), !is.na(physical_environment_zscore))
+
+## Join physical environment quality factors with all_data
+environment_quality <- left_join(tidy_HD, tidy_physical_environment, by = "County")
+all_data <- left_join(nc_wide_asthma_join, environment_quality, by = c("name" = "County"))
+
+# all_data %>% sample_n(5)
+```
+
+---
+
+# Exploratory Spatial Data Analysis
+
+Before we could really work with the data collected from the datasets, we performed a descriptive analysis to get a sense of how we could manipulate our data most usefully. This section includes descriptive statistics, graphs, and text.
+
+## Data Description and Summary
+
+```{r tidy_asthma_race_join}
+## Tidy health data
+nc_health_tidy <- all_data %>% pivot_longer(names_to = "health",
+                              values_to = "health_rates",
+                              cols = average_daily_pm: physical_environment_zscore) 
+
+## Tidy race data
+nc_race_tidy <- all_data %>% pivot_longer(names_to = "race",
+                              values_to = "race_count",
+                              cols = white: poc) 
+nc_race_tidy <- nc_race_tidy %>% mutate(race_pct = race_count/ total_population * 100)
+
+## Import NC_counties geospatial info
+require(sf)
+NC_counties <- read_sf(dsn = ".", layer = "NC_counties")
+
+## Change data to snake case for ease of join
+# colnames(NC_counties)[1:10]
+nc_shp <- NC_counties %>% clean_names(case ="snake") # snake case makes everything lower case and replaces spaces with `_`
+
+## Join geospatial data to the all_data dataset
+nc_shp <- nc_shp %>% select(name = co_name, geometry) %>%
+  mutate(name = name %>% str_to_title())
+
+all_data_geo <- all_data %>% mutate(name = name %>% str_replace(" County, North Carolina","")) %>% left_join(nc_shp, by = "name") %>% st_sf()
+
+## Show the top 10 counties with highest asthma rates
+asthma_rank <- all_data %>% select(name, total_rate) %>% arrange(desc(total_rate))
+asthma_rank %>% top_n(10)
+```
+
+The above tibble shows, in list form, the counties that show the highest `total_rate` values, which denote high asthma rates.
+
+```{r total_rates_histogram}
+## Show histogram of asthma rates in North Carolina
+all_data %>% ggplot(aes(x= total_rate)) + geom_histogram(binwidth = 10 ,col = "white") + geom_rug() + scale_x_continuous()+
+  theme_minimal() + ggtitle("Histogram of Total Asthma Rates in North Carolina")
+```
+
+The histogram above shows the distribution of `total_rate` values, which describe asthma rates, across the state of North Carolina. There is a large number of counties that fall under an approximate rate of 100, but there are some outliers reaching up to over 300.
+
+```{r asthma_rates_map}
+## Import packages for map analysis
+library(RColorBrewer)
+library(tmap)
+library(units)
+
+## Map asthma rates
+asthma_rates_map <- tm_shape(all_data_geo) + 
+    tm_polygons(col = "total_rate", palette = "BuPu", style = "quantile",
+            border.col = "white", border.alpha = 0.5) + 
+    tm_shape(all_data_geo) + tm_borders(col = "black") + 
+    tm_layout(panel.show = T, panel.labels = "Asthma Rate Levels in NC", title.size = 1, legend.outside = T)
+
+asthma_rates_map
+```
+
+The choropleth map above spatially displays the asthma rate levels `(total_rate)` of counties in NC. There is a slight visible clustering of high asthma rates in the northeast and southern parts of NC. `total_rate` is derived from the 2014 BRFSS data on recorded discharges of asthma diagnosis by county.
+
+```{r top_10_tibble_PE}
+## Show the top 10 counties with the highest z-scores for physical environment
+physical_environment_rank <- all_data %>% select(name, physical_environment_zscore) %>% arrange(desc(physical_environment_zscore))
+physical_environment_rank %>% top_n(10)
+```
+
+The tibble above shows, in list form, the counties that show the highest `physical_environment_zscore` values, in which a higher score denotes a better physical environment.
+
+``` {r physical_environment_histogram}
+## Show histogram of physical environment z-scores in North Carolina
+all_data %>% ggplot(aes(x=physical_environment_zscore)) + geom_histogram(binwidth = .02 ,col = "white") + ggtitle("Histogram of Physical Environment Z-Scores in North Carolina") + theme_minimal()
+```
+
+The histogram above shows the distribution of `physical_environment_zscore` values across the state of North Carolina. There is a high concentration of z-scores that fall very close to the mean, with a score close to 0, and there are few outliers.
+
+```{r map_phys_enviro_zscore}
+## Create dataset that includes health factors
+nc_health_tidy_percent <- all_data %>% pivot_longer(names_to = "health",
+                              values_to = "health_rates",
+                              cols = percent_uninsured:percent_adult_smoking) 
+
+nc_health_tidy_percent <- nc_health_tidy_percent %>% mutate(name = name %>% str_replace(" County, North Carolina","")) %>% left_join(nc_shp, by = "name") %>% st_sf()
+
+## Map physical environment z-scores by county
+physical_environment_breaks <- quantile(nc_health_tidy_percent$physical_environment_zscore, na.rm=T) %>% unname()
+all_data_geo %>%
+  mutate(n_breaks = cut(physical_environment_zscore, breaks = physical_environment_breaks, include.lowest = T,
+                        right = F)) %>% 
+  ggplot(aes(fill=n_breaks)) + geom_sf() + ggtitle("Physical Environment Z-Score in NC by County") +
+  scale_fill_brewer(type = "seq",palette = "Oranges") + theme_bw()
+```
+
+This choropleth map displays the physical environment z-scores in North Carolina by county. Physical environment, denoted by the `physical_environment_zscore` variable, is a health factor that incorporates *air quality, water quality, severe housing problems, and transit data, including statistics on how many people commute alone to work or have a long commute (more than 30 minutes)*. The z-score used in this graph is a statistical tool used to express how many standard deviations a specific county is from the mean for that variable in North Carolina. Negative z-scores imply that the physical environment of that county is worse than the mean physical environment of the state. A positive z-score would mean that the physical environment of that county is better than the mean physical environment of the state. `n_breaks` is classified using the quartile system, which outlines the ranges of z-scores that fall under the 25th percentile, are around the mean, or are above the 75th percentile. 
+
+``` {r health_factors_tibble}
+## Show 10 rows of health percentages of each health factor in the Counties of North Carolina
+health_factor_tibble <- all_data %>% select(name, percent_access_to_exercise, percent_adult_smoking,percent_physically_inactive, percent_uninsured)
+health_factor_tibble %>% top_n(10)
+```
+
+The tibble above shows a data sample of `health_rates` data, which describes various measures of health behavior, in North Carolina.
+
+```{r faceted_health_histogram}
+## Show histogram of health percentages of each health factor in North Carolina
+nc_health_tidy_percent %>% ggplot(aes(x= health_rates)) + geom_histogram(binwidth = 10 ,col = "white")  + geom_rug() +
+  facet_wrap(~health) + ggtitle("Histogram of Health Factors in North Carolina") + theme_minimal()
+```
+
+The faceted histograms above show the distribution of `health_factor` values across the state of North Carolina. `Count` describes the number of counties. There is a wider distribution of the `percent_access_to_exercise` factor, while the other factors are less widely distributed, and more concentrated around a smaller range.
+
+```{r maps_percent_countyhealth_facet}
+## Map health rates of each health factor per county
+facet_health_breaks <- quantile(nc_health_tidy_percent$health_rates, na.rm=T) %>% unname()
+nc_health_tidy_percent %>%
+  mutate(n_breaks = cut(health_rates, breaks = facet_health_breaks, include.lowest = T,
+                        right = F)) %>% 
+  ggplot(aes(fill=n_breaks)) + geom_sf() + facet_wrap(~health) +
+  ggtitle("Health Rates in NC by County") +
+  scale_fill_brewer(type = "seq",palette = "Oranges") + theme_bw()
+```
+
+The facet function displays other health factors, like percent of people with access to exercise `(percent_access_to_exercise)`, percent of adults who smoke `(percent_adult_smoking)`, percent of those who are physically inactive `(percent_physically_inactive)`, and percent of those uninsured `(percent_uninsured)`. These factors are helpful in generalizing certain aspects of health in a county. `n_breaks` follows the quartile system of classification.
+
+Some notable observations: Most of the state has at least 31.6% access to exercise, yet there are very few counties that fall in the lowest percentage category for being physically inactive. The rates for smoking are mostly under the mean as a state, but there are small clusters of counties that have percentages higher than 25.5%. The same could be said about the overall trend of the rates of people uninsured in the counties as well. 
+
+## Analysis and Results
+
+The following section explores our specific research questions proposed at the beginning of this document. Graphics, maps, and other spatial tests are run in order to investigate patterns and trends regarding our questions.
+
+``` {r boxplot_asthma_income}
+## Calculate the quartile breaks of asthma rate data
+asthma_quartile_rates <- quantile(all_data$total_rate, na.rm=T)%>% unname() 
+# asthma_quartile_rates
+
+## Classify asthma levels as low, moderate, or high based on quartile system
+nc_health_tidy <- nc_health_tidy %>% clean_names %>%
+mutate(asthma_rate_levels = ifelse(total_rate < asthma_quartile_rates[2], "Low",
+                                     ifelse(total_rate >= asthma_quartile_rates[2] & total_rate < asthma_quartile_rates[4], "Moderate",
+                                            ifelse(total_rate > asthma_quartile_rates[4], "High", "No Data"
+                                                ))))
+nc_health_tidy <- nc_health_tidy %>% mutate(asthma_rate_levels = asthma_rate_levels %>% factor( levels=c("Low", "Moderate", "High"), ordered = TRUE))
+
+## Import required package for boxplot
+library(tidyverse)
+
+## Display distribution of median HH income and asthma shown using boxplot
+boxp <- nc_health_tidy %>%
+  ggplot(aes(x = asthma_rate_levels, y = med_hh_income)) + 
+  geom_boxplot() +
+  theme_minimal()
+boxp + geom_text(aes(label = name), check_overlap = T, 
+                 size = 2.0 ,color = "navy",
+                 position = position_nudge(x = 0.2, y = 0.2)) +
+  labs(x = "Asthma Level",
+       y = "Median Household Income",
+       title = "Distribution of Median HH Income and Asthma Levels in NC Counties")
+```
+
+This boxplot analyzes the relationship between asthma rate levels and median household income `(med_hh_income)`. When anticipating the relationship between median household income and asthma levels, we hypothesized counties of lower socioeconomic status would have higher rates of asthma. The results show a similar trend; places with higher levels of asthma are found in counties where the median income levels are much lower than that of the counties with lower or moderate rates of asthma; counties with low rates and moderate rates have similar distributions, but moderate asthma counties have a higher median income than that of low asthma.
+
+```{r boxplot_majority_asthma}
+## Display distribution of asthma rates and racial composition in NC counties shown using boxplot
+boxp_major <- all_data %>%
+  ggplot(aes(x = white_majority, y = total_rate)) + 
+  geom_boxplot() +
+  theme_minimal()
+boxp_major + geom_text(aes(label = name), check_overlap = T, 
+                 size = 2.0 ,color = "navy",
+                 position = position_nudge(x = 0.2, y = 0.2)) +
+  labs(x = "White or POC Majority",
+       y = "Asthma Rate",
+       title = "Distribution of Asthma Rates and Racial Composition in NC Counties")
+```
+
+This boxplot shows the relationship between white or POC (people of color) majority counties and asthma rates. When predicting the relationship between racial composition and asthma levels in NC counties, we hypothesized counties with a POC majority would have higher rates of asthma. The counties that are identified as having a POC majority also have a higher median asthma rate, as well as higher whiskers and outliers than white majority counties.
+
+```{r health_factors_asthma_scatter}
+## Set labels for each health factor
+labels <- c(average_daily_pm = "Average Daily PM 2.5", percent_uninsured = "The Percent of Individuals Who Are Uninsured", percent_physically_inactive = "The Percent of People Who Are Not Physically Active", percent_access_to_exercise = "Percent of People Who Have Access to Exercise", percent_adult_smoking = "Percent of Adults Who Smoke", physical_environment_zscore = "The Z-Score for Physical Environment")
+
+## Clean label names and create ggplot scatterplots showing relationship between asthma rates and health factors
+nc_health_tidy <- nc_health_tidy %>% clean_names 
+nc_health_tidy %>%
+  ggplot(aes( y = total_rate, x = health_rates)) + 
+    geom_point(color = "maroon") + labs(x = "Health",
+                      y = "Asthma Rates",
+                      title = "The Impact of Health Factors on Asthma Rates ") +
+  geom_smooth() + 
+  facet_wrap(~ health, scales = "free_x", labeller=labeller(health = labels ), nrow = 3) +
+  theme_minimal() + theme(axis.text.y = element_text(size = 6)) 
+```
+
+While attempting to understand the relationship health factors and asthma rates, we transferred this information into scatterplot visuals. Generally, the trendlines do not show extremely strong positive or negative slope, although there are vague trends that can be observed. In the plot of average daily PM 2.5, there are more counties with lower PM 2.5 percentages and high rates of asthma than those with higher PM 2.5 percentages and high rates of asthma. This goes against our hypothesis that air quality increases likelihood of asthma in an individual. The same could trend could be said for the scatterplot displaying exercise acces as well. In the plot of asthma related to the smoking population, it is visible that many counties have a 20%-30% population that smokes, but we cannot extract a clear trend between asthma and smoking. Most counties have less than a 25% uninsured population, and it is difficult to delineate a clear relationship between uninsurance and asthma rates from the plot. Most of the counties are clustered around the 0 z-score for physical environment, with few outliers.
+
+```{r health_factors_boxplots}
+## Show boxplots faceted by health factor
+nc_health_tidy %>%
+  ggplot(aes( x = asthma_rate_levels, y = health_rates)) + geom_boxplot() + theme_minimal() +
+    geom_text(aes(label = name), check_overlap = T,
+                 size = 2.0 ,color = "navy",
+                 position = position_nudge(x = 0.2, y = 0.2)) + labs(x = "Health",
+                      y = "Asthma Rate Level",
+                      title = "The Impact of Health Factors on Asthma Rate Level ") +
+  facet_wrap(~ health, scales = "free_x", labeller = labeller(health = labels ), nrow = 3) +
+  theme_minimal() + theme(axis.text.y = element_text(size = 6)) + coord_flip()
+```
+
+These boxplots show the same data as the previous scatterplots. Here, we are more able to specifically quantify the quartiles of each health factor, based on categories of counties with high, moderate, and low asthma rate levels. 
+
+```{r race_asthma_scatter}
+## Create scatterplots finding relationship between race and asthma
+nc_race_tidy %>%
+  ggplot(aes( y = total_rate, x = race_pct)) + 
+    geom_point(color = "maroon") + labs(x = "Race Count",
+                      y = "Asthma Rates",
+                      title = "Race and Asthma Rates ") +
+  ylim(c(0,400))+
+  geom_smooth() + 
+  facet_wrap(~ race, scales = "free_x", nrow = 3) +
+  theme_minimal() + theme(axis.text.y = element_text(size = 6)) 
+```
+
+These above scatterplots show the relationship between race and asthma rates. Most plots show a positive trendline; the plot of white population shows a negative trendline and the plot on the Hispanic population shows a stagnant trendline that is not strongly positive nor negative.
+
+```{r income_asthma_scatter}
+## Create ggplot scatter plot finding relationship between asthma rates and median househould income
+asthma_income <- all_data %>% clean_names
+asthma_income %>%
+  ggplot(aes( y = total_rate, x = med_hh_income)) +geom_point() + labs(x = "Median Household Income",
+                      y = "Asthma Rates",
+                      title = "The Impact of Median Household Income on Asthma Rates ") + theme_minimal() + theme(axis.text.y = element_text(size = 6)) + geom_smooth()
+```
+
+In order to analyze the relationship between socioeconomic status and asthma rates, we plotted median household incomes against asthma rates. The trend line shows a decrease in asthma rates from the $0 median household income value until approximately $42,500, which afterwards levels off as the median household income numbers increase. This mildly supports our hypothesis that asthma rates decreases with rising median household income.
+
+``` {r income_high_asthma}
+## Make subsequent tmaps interactive
+tmap_mode("view")
+
+## Set a quantile ranking to find places classified as the lowest and highest 25% of median HH income
+quantile_income <- quantile(all_data$med_hh_income, na.rm=T)%>% unname() 
+# quantile_income
+
+## Create interactive map on the spatial distribution of counties with high asthma and high income, and high asthma and low income
+income_high_asthma <- all_data_geo %>% mutate(high_asthma = ifelse(total_rate > asthma_quartile_rates[4], 1, 0),
+             income_level = ifelse(med_hh_income < quantile_income[2], 1,
+             ifelse(med_hh_income >quantile_income[4], 2, 0)),
+             asthma_income = high_asthma*income_level,
+             asthma_income = asthma_income %>% factor(labels = c("High asthma high income", "High asthma low income", "Other"),
+                                                                 levels = c(2, 1, 0)))
+            
+income_asthma_map <- tm_shape(income_high_asthma) + tm_polygons("asthma_income", style = "cat", palette = c("red", "lightblue", "ivory"), id = "name", border.col = "Black", border.alpha = 0.25, title = "Asthma Rates and Income Levels")
+
+income_asthma_map
+```
+
+
+Counties classified as having high rates of asthma and are high-income are shaded in red, while counties classified as having low rates of asthma and are low-income are shaded in light blue. According to this map, more counties with high asthma rates are also low-income. We can begin to observe that there is potentially some level of clustering occurring in counties with high asthma rates; however, this cannot be observed adequately without Moran's I statistics.
+
+``` {r insurance_high_asthma}
+## Set a quantile ranking to find places classified as the lowest and highest 25% of uninsurance
+quantile_uninsured <- quantile(all_data$percent_uninsured, na.rm=T)%>% unname() 
+# quantile_uninsured
+
+## Create interactive map on the spatial distribution of counties with high asthma and high uninsurance, and high asthma and low uninsurance.
+insurance_high_asthma <- all_data_geo %>% mutate(high_asthma = ifelse(total_rate > asthma_quartile_rates[4], 1, 0),
+             uninsured_level = ifelse(percent_uninsured < quantile_uninsured[2], 1,
+             ifelse(percent_uninsured >quantile_uninsured[4], 2, 0)),
+             asthma_insurance = high_asthma*uninsured_level,
+             asthma_insurance = asthma_insurance %>% factor(labels = c("High asthma lowly uninsured", "High asthma highly uninsured", "Other"),
+                                                                 levels = c(2, 1, 0)))
+
+insurance_asthma_map <- tm_shape(insurance_high_asthma) + tm_polygons("asthma_insurance", style = "cat", palette = c("lightblue", "red", "ivory"), id = "name", border.col = "Black", border.alpha = 0.25, title = "Asthma Rates and Uninsurance Levels") 
+
+insurance_asthma_map
+```          
+
+
+Counties classified as having high asthma and are lowly uninsured are shaded in light blue, while counties classified as having high asthma and are highly uninsured are shaded in red color. More counties with high asthma are also highly uninsured.
+
+```{r nc_shp_asthma}
+## Clean nc_shp column names
+nc_shp_asthma <- asthma %>% mutate(name = Residence %>% str_replace(" County, North Carolina","")) %>% left_join(nc_shp, by = "name") %>% st_sf()
+nc_shp_asthma <- nc_shp_asthma %>% clean_names(case ="snake")
+
+## Set plotting mode
+tmap_mode("plot")
+```
+
+```{r lisa}
+library(spdep)
+
+## Convert sf to sp file
+county_sp <- as(nc_shp_asthma,"Spatial")
+cnty_coords <- coordinates(county_sp)
+
+## Analyze and define nearest neighbors (constructs list, looks at distribution of neighbors) based on Queen's 1
+q1 <- poly2nb(county_sp, queen=TRUE)
+# summary(q1)
+
+## Get the cardinality - or the number of neighbors for each observation; this will help us gauge whether our observations have a reasonable distribution of neighbors for calculation. Ideally, we want the distribution to symmetric (close to normal) with a limited range.
+## card(q1) %>% tibble(n = .) %>% ggplot(aes(x = n)) +
+##   geom_histogram(col="white") + theme_minimal()
+## plot(nc_shp$geometry, lwd = 0.2)
+## plot(q1, cnty_coords, col='red', lwd=0.2, cex = 0.5, add = TRUE)
+
+## Calculate spatial weights
+q1w <-  nb2listw(q1, style = "W", zero.policy = FALSE) 
+
+## Find all neighbors within a critical threshold so that there are no values with 0 neighbors
+## Calculate the nearest neighbor for each value
+## Use longlat = T when data is in a geographic coordinate system. This calculates a great circle distance in kms
+
+## Calculate the max distance between 2 centroids as critical threshold
+critical.threshold <- max(unlist(nbdists(q1,cnty_coords, longlat = T)))
+
+## Calculate neighbors within the critical threshold
+nb.dist.band <- dnearneigh(cnty_coords, 0, critical.threshold, longlat = T)
+
+distances <- nbdists(nb.dist.band,cnty_coords,longlat = T)
+# distances[1]
+
+invd1 <- lapply(distances, function(x) (1/x))
+invd1a <- lapply(distances, function(x) (1/(x/100)))
+# invd1a[1]
+
+invd.weights <- nb2listw(nb.dist.band,glist = invd1a,style = "B")
+# summary(invd.weights)
+
+## Find nearest 8 neighbors
+k8 <- knn2nb(knearneigh(cnty_coords, k = 8))
+# plot(k6, cnty_coords, lwd=.2, col="blue", cex = .5)
+weights.knn <- nb2listw(k8,glist = k8,style = "B")
+
+## Nearest 8 neighbors but inversely weighted
+k8 <- knn2nb(knearneigh(cnty_coords, k = 8,longlat = T))
+k.distances <- nbdists(k8, cnty_coords, longlat = T)
+invd2a <- lapply(k.distances, function(x) (1/(x/100)))
+invd.weights.knn <- nb2listw(k8,glist = invd2a,style = "B")
+# invd.weights.knn$weights[1]
+
+q1_invd_lisa <- as.data.frame(localmoran(county_sp$total_rate, invd.weights.knn, zero.policy = FALSE))
+
+q1_invd_lisa$Cat <- rep("0", nrow(q1_invd_lisa))
+
+## Scale the input data to mean
+cDV <- county_sp$total_rate - mean(county_sp$total_rate) 
+# Get spatial lag values for each observation
+lagDV <- lag.listw(q1w, county_sp$total_rate)
+
+## Scale the lag values
+clagDV <- lagDV - mean(lagDV, na.rm = TRUE)
+## Simply add a label based on the values
+q1_invd_lisa$Cat[which(cDV > 0 & clagDV > 0 & q1_invd_lisa[,5] < 0.05)] <- "HH" 
+q1_invd_lisa$Cat[which(cDV < 0 & clagDV < 0 & q1_invd_lisa[,5] < 0.05)] <- "LL"      
+q1_invd_lisa$Cat[which(cDV < 0 & clagDV > 0 & q1_invd_lisa[,5] < 0.05)] <- "LH"
+q1_invd_lisa$Cat[which(cDV > 0 & clagDV < 0 & q1_invd_lisa[,5] < 0.05)] <- "HL"
+
+# Quick summary of LISA output
+# table(q1_invd_lisa$Cat)
+
+county_lisa <- nc_shp_asthma %>% bind_cols(q1_invd_lisa)
+
+## tm_shape(county_lisa) + tm_polygons("Cat", style = "cat", palette = c("grey", "red", "pink", "lightblue", "blue"), border.col = "Black", border.alpha = 0.25)
+```
+
+```{r morans_I}
+## Calculate Moran's I 
+mor_q1 <- moran.mc(x = county_sp$total_rate, listw = invd.weights.knn, zero.policy = FALSE, nsim = 5000, adjust.n = T)
+mor_q1
+```
+
+The Moran's I statistic of 0.27332 shows slight clustering; this is also denoted as statistically significant by the p-value.
+
+
+```{r hot_spots_lisa_map}
+## Make interactive map
+tmap_mode("view")
+
+## Arrange asthma map with lisa map
+## Yellow shows counties that are in the range of mean asthma rate for North Carolina; blue shades show counties with asthma rates below the state mean; orange and red colors show counties with asthma rates above the state mean
+hot_spot_sd <-tm_shape(county_sp) + tm_polygons(col = "total_rate", palette = "-RdYlBu", n= 6, style = "sd", title = "Hotspots of Asthma Rates") + tm_shape(county_sp) + tm_borders(col = "black")
+
+lisa_map <- tm_shape(county_lisa) + tm_polygons("Cat", style = "cat", palette = c("grey", "red", "pink", "lightblue", "blue"), border.col = "Black", border.alpha = 0.25, title = "Hotspots of Asthma Rates")
+
+tmap_arrange(hot_spot_sd, lisa_map)
+```
+
+The two spatial maps above employ the Moran's I statistic to determine hotspots of high asthma rates. The top map shows counties that are above and below the state mean of asthma level (breaks in the legend employ use of standard deviations of `total_rate` values). The bottom map colorizes those counties with high asthma rates that also have a high number of nearest neighbors, as denoted by the `Cat` variable. Red `(HH)` shows a higher magnitude of asthma rates with neighbors, while pink `(LL)` shows a lower magnitude). Important note: this statistic was calculated using 8 nearest neighbors.
+
+---
+
+# Discussion and Conclusion
+
+**While the overarching question we aimed to explore at the start of this investigation revolved around the direct relationship between socioeconomic status and asthma, we found ourselves including a large network of other factors in our investigation.** After plotting a boxplot of median household income based on low, moderate, and high levels of asthma rates, we noticed a trend that was slightly different from our hypothesis. We asked – why is there not as strong of a correlation between asthma rates and median household income? We hypothesized that lower-income counties would have higher rates of asthma due to a lack of financial support for health resources. This further led us to explore other factors that may contribute to this health disparity regarding asthma. We explored the uninsurance rates of a population, which showed a slight positive correlation. We began to realize – maybe a possible explanation for the low asthma rates in low-income counties may be that some asthma cases in these counties may not be recorded, due to many people’s inability to seek medical attention. This observation forced us to begin thinking about other variables that play a role in asthma prevalence and distribution across North Carolina.
+
+Another striking relationship we found was that between asthma and race. Counties with a higher POC population showed higher rates of asthma levels, which followed our hypothesis. We have speculated that many POC, minority communities also face higher rates of uninsurance, lack of financial support, lack of education, and overall underrepresentation when receiving care and attention from institutional organizations. This, we believe, translates to the poor medical care that POC may face in their daily life. Furthermore, the slight clustering of areas with high asthma rates may be explained by the clustering of POC communities. 
+
+Perhaps we can also think about how environmental injustices may relate to this trend. Do those counties that have a POC majority show high levels of asthma rates because they are also living in environmentally poor conditions? This question may not be so clearly answered with the data outputs that we created. For example, our data suggests that those with low rates of asthma have high averages of PM 2.5, which is a sign of high air pollution. Furthermore, there is not a strong correlation between asthma rates and physical environment z-scores. This goes against our hypothesis that poor environmental quality, specifically air quality, causes higher rates of asthma. However, it is impossible to delineate a clear relationship between air quality and asthma because air quality encapsulates many other attributes, including ozone health, other particulate matter, other indoor and outdoor pollutants, and many others. PM 2.5 is not the only facet of air quality; therefore, we cannot establish a firm correlation.
+
+A vague trend shows that those who have better general health, denoted by measures of high exercise access and high physical activity, also show low levels of asthma rates. It may be of interest to explore the impact of physical health on asthma rates further.
+
+Other factors that we explored seemed to show an unexpected correlation with asthma. Based on our outputs, counties classified as having low, moderate, and high levels of asthma all show similar percentages of adults who smoke; this went against our hypothesis that smoking leads to compromised lung capacity, which may increase likelihood of asthma. Physical environment, which encapsulates many factors including housing condition, transportation patterns, and air quality, did not produce outputs in which we could observe any clear, strong relationship.
+
+As a final note, further analysis must be undergone in order to gain a holistic view of asthma trends across the state. Many of the unclear relationships we observed is perhaps due to insufficient data collection and communication, as well as inadequate representation of the most accurate, in-depth analysis of the data at hand. **Generally, this investigation, while broad and brief, allows us to raise questions about possible relationships between investigated factors and asthma, and calls us to more deeply look into these observations.** 
+
+---
+
+# Limitations and Future Work
+
+There are so many other factors to consider in terms of air quality. For air quality, we focused on PM 2.5 levels and the z-scores for the physical environment. However, these two factors cannot account for all of the things that contribute to air quality, like ozone condition or other outdoor and indoor pollutants in our atmosphere – these factors may also contribute to asthma rates and levels. Furthermore, there are so many other factors, not directly describing air quality, that can also potentially impact asthma rates. Because of this, we must be careful about the conclusions we make – we cannot devise causation relationships, but must only speculate based on the trends we observe from our specific data. Although we will be able to see potential correlations between many environmental factors, race, and socioeconomics with asthma rates, we cannot attribute these factors as sole causes of the high or low asthma rates in each county. If we had more time, we would probably explore additional data and see how they might pertain to asthma prevalence within North Carolina. 
+
+---
+
+# Challenges
+
+One challenge we faced regards data interpretation. In the initial stages, we were uncertain about how to manipulate our data to yield the best, most accurate results. Regarding our asthma datasets, there were instances where we didn’t know whether it was better to use the asthma rates data or the raw number of cases. In the end, we settled for mostly using the asthma rates data because it showed better comparisons between counties with different populations; solely looking at the number of cases would not account for the population differences. This group project also produced some technical issues – it was at times challenging to compile and interpret everyone’s codes cohesively. In order to make this shared code easier to interpret for one another, we tried being a lot more specific with every dataset or variable that we named. Since we all tried to clean data for our own assigned tasks, it was also a bit difficult to keep track of the many datasets we developed and their alterations. Overall, we believe that with more practice, R has the potential to be a great platform for team collaboration on more of our data science projects in the future.
+
